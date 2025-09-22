@@ -1,0 +1,11 @@
+# node
+node_modules/
+web/.next/
+web/.vercel/
+web/.env*
+# android
+android/.gradle/
+android/.idea/
+android/local.properties
+android/**/build/
+android/keystore.p12
