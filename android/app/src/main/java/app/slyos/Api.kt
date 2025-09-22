@@ -12,7 +12,7 @@ import java.net.URL
 object Api {
   private const val TAG = "SlyOS.Api"
   private const val TIMEOUT = 15000
-  private const val DEFAULT_BASE = "http://127.0.0.1:3000"
+  private val DEFAULT_BASE = BuildConfig.API_BASE
 
   @Volatile private var overrideBase: String? = null
   fun setBase(url: String?) {

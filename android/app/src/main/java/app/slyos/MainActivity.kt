@@ -42,7 +42,7 @@ fun App(){
   var totalCredits by remember { mutableStateOf(0) }
   var phoneCredits by remember { mutableStateOf(0) }
   var serverBase by remember {
-    mutableStateOf(prefs(ctx).getString("server_base", "http://127.0.0.1:3000") ?: "http://127.0.0.1:3000")
+    mutableStateOf(prefs(ctx).getString("server_base", BuildConfig.API_BASE) ?: BuildConfig.API_BASE)
   }
 
   fun refreshCredits(){

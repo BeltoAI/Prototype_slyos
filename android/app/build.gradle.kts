@@ -13,7 +13,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-        buildConfigField("String", "API_BASE", "\"http://127.0.0.1:3000\"")
+        buildConfigField("String", "API_BASE", ""http://localhost:3000"" )
     }
 
     buildTypes {
