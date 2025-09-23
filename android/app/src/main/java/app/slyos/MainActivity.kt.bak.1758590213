@@ -116,14 +116,6 @@ fun App(){
               refreshCredits()
             }
           }){ Text("Register device") }
-          OutlinedButton(onClick={
-            val fakeId = "debug-" + java.util.UUID.randomUUID().toString().takeLast(8)
-            Api.deviceId = fakeId
-            prefs(ctx).edit().putString("device_id", fakeId).apply()
-            deviceReady = true
-            startSvc()
-            status = "Forced start (debug id)"
-          }){ Text("Force start worker (debug)") }
         } else {
           val id = Api.deviceId ?: prefs(ctx).getString("device_id", null) ?: "?"
           if(Api.deviceId==null) Api.deviceId = prefs(ctx).getString("device_id", null)

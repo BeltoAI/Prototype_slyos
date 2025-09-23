@@ -7,8 +7,8 @@ import android.app.Service
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
 import androidx.core.app.NotificationCompat
+import android.util.Log
 import app.slyos.Api
 import kotlinx.coroutines.*
 
@@ -61,7 +61,11 @@ class WorkerService : Service() {
                 Log.d("SlyOS", "Worker: fetched text len=${text.length}")
 
                 val embedding = Api.embedDemo(text)
-                val ok = if (embedding.isNotEmpty()) Api.submit(id, embedding) else Api.submit(id, text)
+                val ok = if (embedding.isNotEmpty()) {
+                    Api.submit(id, embedding)
+                } else {
+                    Api.submit(id, text)
+                }
                 Log.d("SlyOS", "Worker: submit ok=$ok")
             } catch (t: Throwable) {
                 Log.e("SlyOS", "Worker error: $t")

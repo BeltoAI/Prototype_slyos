@@ -1,0 +1,101 @@
+package app.slyos
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.logging.HttpLoggingInterceptor
+import org.json.JSONObject
+
+object Api {
+    @Volatile private var base: String = BuildConfig.API_BASE
+    @Volatile var deviceId: String? = null
+
+    private val httpLogging = HttpLoggingInterceptor { msg -> Log.d("OkHttp", msg) }
+        .apply { level = HttpLoggingInterceptor.Level.BODY }
+
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .addInterceptor(httpLogging)
+            .build()
+    }
+
+    fun setBase(b: String) {
+        base = if (b.isBlank()) BuildConfig.API_BASE else b
+        Log.d("SlyOS", "API base set to: $base")
+    }
+
+    private fun url(path: String): String =
+        base.trimEnd('/') + path
+
+    /** POST /api/device/register { model, osVersion } -> sets deviceId if server returns it */
+    suspend fun registerDevice(model: String, osVersion: String): Boolean = withContext(Dispatchers.IO) {
+        Log.d("SlyOS", "Api.register: ENTER")
+        val bodyJson = JSONObject()
+            .put("model", model)
+            .put("osVersion", osVersion)
+            .toString()
+        val req = Request.Builder()
+            .url(url("/api/device/register"))
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        val res = client.newCall(req).execute()
+        Log.d("SlyOS", "Api.register: HTTP ${res.code}")
+
+        if (res.isSuccessful) {
+            val body = res.body?.string().orEmpty()
+            try {
+                // Try to parse {"id":"..."} or {"deviceId":"..."}
+                val js = if (body.isBlank()) JSONObject() else JSONObject(body)
+                val id = when {
+                    js.has("id") -> js.optString("id", null)
+                    js.has("deviceId") -> js.optString("deviceId", null)
+                    else -> null
+                }
+                if (!id.isNullOrBlank()) {
+                    deviceId = id
+                    Log.d("SlyOS", "Api.register: deviceId set to $id")
+                }
+            } catch (_: Throwable) {
+                // ignore parse errors
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /** GET /api/credits/total -> Int (accepts plain number or {"total":N}) */
+    suspend fun creditsTotal(): Int = withContext(Dispatchers.IO) {
+        val req = Request.Builder()
+            .url(url("/api/credits/total"))
+            .get()
+            .build()
+        val res = client.newCall(req).execute()
+        if (res.isSuccessful) {
+            val body = res.body?.string().orEmpty()
+            try {
+                body.trim().toIntOrNull() ?: JSONObject(body).optInt("total", 0)
+            } catch (_: Throwable) { 0 }
+        } else 0
+    }
+
+    /** GET /api/credits/device/{id} -> Int (accepts plain number or {"credits":N}) */
+    suspend fun deviceCredits(id: String): Int = withContext(Dispatchers.IO) {
+        val req = Request.Builder()
+            .url(url("/api/credits/device/$id"))
+            .get()
+            .build()
+        val res = client.newCall(req).execute()
+        if (res.isSuccessful) {
+            val body = res.body?.string().orEmpty()
+            try {
+                body.trim().toIntOrNull() ?: JSONObject(body).optInt("credits", 0)
+            } catch (_: Throwable) { 0 }
+        } else 0
+    }
+}

@@ -1,0 +1,196 @@
+package app.slyos
+
+import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.logging.HttpLoggingInterceptor
+import org.json.JSONArray
+import org.json.JSONObject
+
+object Api {
+    @Volatile private var base: String = BuildConfig.API_BASE
+    @Volatile var deviceId: String? = null
+
+    private val httpLogging = HttpLoggingInterceptor { msg -> Log.d("OkHttp", msg) }
+        .apply { level = HttpLoggingInterceptor.Level.BODY }
+
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .addInterceptor(httpLogging)
+            .build()
+    }
+
+    fun setBase(b: String) {
+        base = if (b.isBlank()) BuildConfig.API_BASE else b
+        Log.d("SlyOS", "API base set to: $base")
+    }
+
+    private fun url(path: String): String = base.trimEnd('/') + path
+    private fun jsonOrNull(body: String?): JSONObject? =
+        try { if (body.isNullOrBlank()) null else JSONObject(body) } catch (_: Throwable) { null }
+
+    // ---------------- Device registration & credits ----------------
+
+    /** POST /api/device/register { model, osVersion } -> sets deviceId if server returns it */
+    suspend fun registerDevice(model: String, osVersion: String): Boolean = withContext(Dispatchers.IO) {
+        Log.d("SlyOS", "Api.register: ENTER")
+        val bodyJson = JSONObject()
+            .put("model", model)
+            .put("osVersion", osVersion)
+            .toString()
+
+        val req = Request.Builder()
+            .url(url("/api/device/register"))
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        val res = client.newCall(req).execute()
+        Log.d("SlyOS", "Api.register: HTTP ${res.code}")
+
+        if (res.isSuccessful) {
+            val body = res.body?.string().orEmpty()
+            val js = jsonOrNull(body)
+            val id = js?.optString("id", null)
+                ?: js?.optString("deviceId", null)
+            if (!id.isNullOrBlank()) {
+                deviceId = id
+                Log.d("SlyOS", "Api.register: deviceId set to $id")
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /** GET /api/credits/total -> Int (accepts plain number or {"total":N}) */
+    suspend fun creditsTotal(): Int = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url(url("/api/credits/total")).get().build()
+        val res = client.newCall(req).execute()
+        if (res.isSuccessful) {
+            val body = res.body?.string().orEmpty()
+            body.trim().toIntOrNull() ?: jsonOrNull(body)?.optInt("total", 0) ?: 0
+        } else 0
+    }
+
+    /** GET /api/credits/device/{id} -> Int (accepts plain number or {"credits":N}) */
+    suspend fun deviceCredits(id: String): Int = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url(url("/api/credits/device/$id")).get().build()
+        val res = client.newCall(req).execute()
+        if (res.isSuccessful) {
+            val body = res.body?.string().orEmpty()
+            body.trim().toIntOrNull() ?: jsonOrNull(body)?.optInt("credits", 0) ?: 0
+        } else 0
+    }
+
+    // ---------------- WorkerService APIs (claim/fetch/embed/submit) ----------------
+    // These are written defensively: strong logs + sensible fallbacks so we can
+    // quickly adjust paths/methods once we see server behavior in logcat.
+
+    /** Claim a job. Tries GET first; if 405/404, retries POST. Returns job id or null. */
+    suspend fun claim(): String? = withContext(Dispatchers.IO) {
+        fun parseId(body: String?): String? {
+            val js = jsonOrNull(body) ?: return null
+            return js.optString("id", null)
+                ?: js.optString("jobId", null)
+                ?: js.optString("uid", null)
+        }
+
+        // Attempt 1: GET /api/jobs/claim
+        var req = Request.Builder().url(url("/api/jobs/claim")).get().build()
+        Log.d("SlyOS", "Api.claim: GET ${req.url}")
+        var res = client.newCall(req).execute()
+        if (res.code == 405 || res.code == 404) {
+            // Attempt 2: POST /api/jobs/claim (empty JSON)
+            val body: RequestBody = "{}".toRequestBody("application/json; charset=utf-8".toMediaType())
+            req = Request.Builder().url(url("/api/jobs/claim")).post(body).build()
+            Log.d("SlyOS", "Api.claim: POST ${req.url}")
+            res = client.newCall(req).execute()
+        }
+        Log.d("SlyOS", "Api.claim: HTTP ${res.code}")
+        if (!res.isSuccessful) return@withContext null
+        val body = res.body?.string().orEmpty()
+        parseId(body)
+    }
+
+    /** Fetch raw text payload for a job id. */
+    suspend fun fetchText(id: String): String = withContext(Dispatchers.IO) {
+        // Try common patterns; first successful wins
+        val paths = listOf(
+            "/api/jobs/$id/text",
+            "/api/job/$id/text",
+            "/api/ops/job/$id/text"
+        )
+        for (p in paths) {
+            val req = Request.Builder().url(url(p)).get().build()
+            Log.d("SlyOS", "Api.fetchText: GET ${req.url}")
+            val res = client.newCall(req).execute()
+            if (res.isSuccessful) {
+                return@withContext res.body?.string().orEmpty()
+            }
+            Log.d("SlyOS", "Api.fetchText: HTTP ${res.code} for $p")
+        }
+        ""
+    }
+
+    /**
+     * Get an embedding for text. Returns a JSON-ready array (List<Double>) so it’s easy to submit.
+     * If your server returns {"vector":[...]} or {"embedding":[...]}, both are handled.
+     */
+    suspend fun embedDemo(text: String): List<Double> = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().put("text", text).toString()
+        val req = Request.Builder()
+            .url(url("/api/ops/embed"))
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        Log.d("SlyOS", "Api.embedDemo: POST ${req.url}")
+        val res = client.newCall(req).execute()
+        Log.d("SlyOS", "Api.embedDemo: HTTP ${res.code}")
+        if (!res.isSuccessful) return@withContext emptyList()
+
+        val body = res.body?.string().orEmpty()
+        val js = jsonOrNull(body) ?: return@withContext emptyList()
+        val arr: JSONArray? =
+            if (js.has("vector")) js.optJSONArray("vector")
+            else if (js.has("embedding")) js.optJSONArray("embedding")
+            else null
+        if (arr == null) return@withContext emptyList()
+        val out = ArrayList<Double>(arr.length())
+        for (i in 0 until arr.length()) out += arr.optDouble(i, 0.0)
+        out
+    }
+
+    /** Submit a result (string) for a job id. */
+    suspend fun submit(id: String, result: String): Boolean = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().put("result", result).toString()
+        val req = Request.Builder()
+            .url(url("/api/jobs/$id/submit"))
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        Log.d("SlyOS", "Api.submit(str): POST ${req.url}")
+        val res = client.newCall(req).execute()
+        Log.d("SlyOS", "Api.submit(str): HTTP ${res.code}")
+        res.isSuccessful
+    }
+
+    /** Submit an embedding vector (List<Double>) for a job id. */
+    suspend fun submit(id: String, vector: List<Double>): Boolean = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().put("vector", JSONArray(vector)).toString()
+        val req = Request.Builder()
+            .url(url("/api/jobs/$id/submit"))
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        Log.d("SlyOS", "Api.submit(vec): POST ${req.url}")
+        val res = client.newCall(req).execute()
+        Log.d("SlyOS", "Api.submit(vec): HTTP ${res.code}")
+        res.isSuccessful
+    }
+
+    /** Submit a float array too, in case WorkerService uses FloatArray. */
+    suspend fun submit(id: String, vector: FloatArray): Boolean =
+        submit(id, vector.map { it.toDouble() })
+}

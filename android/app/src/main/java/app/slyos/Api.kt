@@ -3,134 +3,241 @@ package app.slyos
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.logging.HttpLoggingInterceptor
+import org.json.JSONArray
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.net.HttpURLConnection
-import java.net.URL
 
 object Api {
-  private const val TAG = "SlyOS.Api"
-  private const val TIMEOUT = 15000
-  private val DEFAULT_BASE = BuildConfig.API_BASE
+    @Volatile private var base: String = BuildConfig.API_BASE
+    @Volatile var deviceId: String? = null
 
-  @Volatile private var overrideBase: String? = null
-  fun setBase(url: String?) {
-    overrideBase = url?.trim()?.ifBlank { null }?.replace("localhost", "127.0.0.1")
-    Log.d(TAG, "Using base=" + (overrideBase ?: DEFAULT_BASE))
-  }
-  fun currentBase(): String = overrideBase ?: DEFAULT_BASE
+    private val httpLogging = HttpLoggingInterceptor { msg -> Log.d("OkHttp", msg) }
+        .apply { level = HttpLoggingInterceptor.Level.BODY }
 
-  var deviceId: String? = null
-
-  private fun readAll(conn: HttpURLConnection): String {
-    val reader = BufferedReader(InputStreamReader(
-      if (conn.responseCode in 200..299) conn.inputStream else (conn.errorStream ?: conn.inputStream)
-    ))
-    val sb = StringBuilder()
-    var line: String?
-    while (reader.readLine().also { line = it } != null) sb.append(line).append('\n')
-    reader.close()
-    return sb.toString()
-  }
-
-  private suspend fun rawGet(path: String): String = withContext(Dispatchers.IO) {
-    val u = URL(currentBase() + path)
-    val c = (u.openConnection() as HttpURLConnection).apply {
-      requestMethod = "GET"; connectTimeout = TIMEOUT; readTimeout = TIMEOUT
+    private val client: OkHttpClient by lazy {
+        OkHttpClient.Builder().addInterceptor(httpLogging).build()
     }
-    val body = readAll(c); c.disconnect(); body
-  }
 
-  private suspend fun rawPost(path: String, jsonBody: JSONObject): String = withContext(Dispatchers.IO) {
-    val u = URL(currentBase() + path)
-    val c = (u.openConnection() as HttpURLConnection).apply {
-      requestMethod = "POST"; doOutput = true
-      setRequestProperty("Content-Type","application/json")
-      connectTimeout = TIMEOUT; readTimeout = TIMEOUT
+    fun setBase(b: String) {
+        base = if (b.isBlank()) BuildConfig.API_BASE else b
+        Log.d("SlyOS", "API base set to: $base")
     }
-    c.outputStream.use { it.write(jsonBody.toString().toByteArray()) }
-    val body = readAll(c); c.disconnect(); body
-  }
 
-  private suspend fun safeGet(path: String): String? =
-    try { rawGet(path) } catch (t:Throwable){ Log.e(TAG, "GET fail $path", t); null }
+    private fun url(path: String): String = base.trimEnd('/') + path
 
-  private suspend fun safePost(path: String, jsonBody: JSONObject): String? =
-    try { rawPost(path, jsonBody) } catch (t:Throwable){ Log.e(TAG, "POST fail $path", t); null }
+    private fun jsonOrNull(s: String?): JSONObject? = try {
+        if (s.isNullOrBlank()) null else JSONObject(s)
+    } catch (_: Throwable) { null }
 
-  suspend fun registerDevice(model:String, osVersion:String): Boolean {
-    val txt = safePost("/api/devices/register", JSONObject().put("model", model).put("osVersion", osVersion))
-      ?: return false
-    return try {
-      val jo = JSONObject(txt)
-      val id = jo.optString("deviceId", "")
-      if (id.isNotEmpty()) { deviceId = id; true } else false
-    } catch (_:Throwable){ false }
-  }
+    private fun Request.Builder.addDevHeaders(): Request.Builder {
+        val id = deviceId
+        if (!id.isNullOrBlank()) addHeader("X-Device-Id", id)
+        return this
+    }
+    private fun withDevQuery(path: String): String {
+        val id = deviceId ?: return path
+        return path + (if (path.contains("?")) "&" else "?") + "deviceId=" + id
+    }
 
-  suspend fun creditsTotal(): Int {
-    return try {
-      val txt = safeGet("/api/credits/info") ?: return 0
-      JSONObject(txt).optInt("total", 0)
-    } catch (_:Throwable){ 0 }
-  }
+    // ---------------- Registration (optional; harmless if server lacks it) ----------------
+    suspend fun registerDevice(model: String, osVersion: String): Boolean = withContext(Dispatchers.IO) {
+        Log.d("SlyOS", "Api.register: ENTER")
+        val bodyJson = JSONObject().put("model", model).put("osVersion", osVersion).toString()
+        val bodies = listOf(bodyJson)
+        val paths = listOf("/api/device/register", "/api/ops/device/register")
+        for (p in paths) {
+            val req = Request.Builder()
+                .url(url(p))
+                .addDevHeaders()
+                .post(bodies[0].toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+            val res = client.newCall(req).execute()
+            Log.d("SlyOS", "Api.register: $p -> HTTP ${res.code}")
+            if (res.isSuccessful) {
+                val body = res.body?.string().orEmpty()
+                val js = jsonOrNull(body)
+                val id = js?.optString("id", null) ?: js?.optString("deviceId", null)
+                if (!id.isNullOrBlank()) {
+                    deviceId = id
+                    Log.d("SlyOS", "Api.register: deviceId set to $id")
+                }
+                return@withContext true
+            }
+        }
+        false
+    }
 
-  suspend fun deviceCredits(id:String): Int {
-    return try {
-      val txt = safeGet("/api/devices/credits?deviceId=$id") ?: return 0
-      JSONObject(txt).optInt("total", 0)
-    } catch (_:Throwable){ 0 }
-  }
+    // ---------------- Credits ----------------
+    suspend fun creditsTotal(): Int = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url(url("/api/credits/total")).get().build()
+        val res = client.newCall(req).execute()
+        if (!res.isSuccessful) 0 else run {
+            val body = res.body?.string().orEmpty()
+            body.trim().toIntOrNull() ?: (jsonOrNull(body)?.optInt("total", 0) ?: 0)
+        }
+    }
+    suspend fun deviceCredits(id: String): Int = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url(url("/api/credits/device/$id")).get().build()
+        val res = client.newCall(req).execute()
+        if (!res.isSuccessful) 0 else run {
+            val body = res.body?.string().orEmpty()
+            body.trim().toIntOrNull() ?: (jsonOrNull(body)?.optInt("credits", 0) ?: 0)
+        }
+    }
 
-  data class Claim(
-    val _id:String?, val type:String?, val creditValue:Int?, val payload: Map<String,String>?
-  )
+    // ---------------- Job pulling / pushing ----------------
 
-  // ********** FIXED HERE **********
-  suspend fun claim(): Claim? {
-    val id = deviceId ?: return null
-    val txt = safePost("/api/units/claim", JSONObject().put("deviceId", id)) ?: return null
-    return try {
-      val jo = JSONObject(txt)
-      // Success == server returns a unit with "_id"
-      val unitId = jo.optString("_id", "")
-      if (unitId.isEmpty()) return null  // covers {claimed:false, message:"no task"}
-      val payload = mutableMapOf<String,String>().apply {
-        jo.optJSONObject("payload")?.let { p -> p.keys().forEach { k -> put(k, p.optString(k, "")) } }
-      }
-      Claim(
-        _id = unitId,
-        type = jo.optString("type", null),
-        creditValue = if (jo.has("creditValue")) jo.optInt("creditValue") else null,
-        payload = payload
-      )
-    } catch (_:Throwable){ null }
-  }
-  // ********************************
+    /** Claim a job; tries many routes + GET/POST + passes deviceId in header & query. */
+    suspend fun claim(): String? = withContext(Dispatchers.IO) {
+        fun parseId(body: String?): String? {
+            val js = jsonOrNull(body) ?: return null
+            return js.optString("id", null) ?: js.optString("jobId", null) ?: js.optString("uid", null)
+        }
+        val claimPaths = listOf(
+            "/api/ops/jobs/claim",
+            "/api/ops/jobs/next",
+            "/api/ops/claim",
+            "/api/ops/claim-job",
+            "/api/jobs/claim",
+            "/api/jobs/next",
+            "/api/job/claim",
+            "/api/job/next",
+            "/api/ops/job/claim"
+        )
+        for (p in claimPaths) {
+            // Try GET with deviceId in query
+            run {
+                val req = Request.Builder()
+                    .url(url(withDevQuery(p)))
+                    .addDevHeaders()
+                    .get()
+                    .build()
+                Log.d("SlyOS", "Api.claim: GET ${req.url}")
+                val res = client.newCall(req).execute()
+                if (res.isSuccessful) {
+                    val body = res.body?.string().orEmpty()
+                    parseId(body)?.let { return@withContext it }
+                }
+            }
+            // Try POST with deviceId header/json
+            run {
+                val body = JSONObject().put("deviceId", deviceId ?: "").toString()
+                val req = Request.Builder()
+                    .url(url(p))
+                    .addDevHeaders()
+                    .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+                Log.d("SlyOS", "Api.claim: POST ${req.url}")
+                val res = client.newCall(req).execute()
+                Log.d("SlyOS", "Api.claim: HTTP ${res.code}")
+                if (res.isSuccessful) {
+                    val resp = res.body?.string().orEmpty()
+                    parseId(resp)?.let { return@withContext it }
+                }
+            }
+        }
+        null
+    }
 
-  suspend fun submit(unitId:String, preview:String): Boolean {
-    val id = deviceId ?: return false
-    val res = JSONObject().put("status","ok").put("preview", preview)
-    val body = JSONObject().put("jobUnitId", unitId).put("deviceId", id).put("result", res).put("runtimeMs", 42)
-    val txt = safePost("/api/units/submit", body) ?: return false
-    return try { JSONObject(txt).optBoolean("ok", false) } catch (_:Throwable){ false }
-  }
+    /** Fetch plain text payload for a job id (tries several paths). */
+    suspend fun fetchText(id: String): String = withContext(Dispatchers.IO) {
+        val paths = listOf(
+            "/api/jobs/$id/text",
+            "/api/job/$id/text",
+            "/api/ops/job/$id/text",
+            "/api/jobs/$id" // some servers return text directly
+        )
+        for (p in paths) {
+            val req = Request.Builder().url(url(p)).addDevHeaders().get().build()
+            Log.d("SlyOS", "Api.fetchText: GET ${req.url}")
+            val res = client.newCall(req).execute()
+            if (res.isSuccessful) {
+                val body = res.body?.string().orEmpty()
+                // If JSON like {"text":"..."} pull text, else return raw
+                jsonOrNull(body)?.optString("text", null)?.let { return@withContext it }
+                return@withContext body
+            } else {
+                Log.d("SlyOS", "Api.fetchText: HTTP ${res.code} for $p")
+            }
+        }
+        ""
+    }
 
-  suspend fun fetchText(url:String): String = withContext(Dispatchers.IO) {
-    try {
-      val u = URL(url)
-      val c = (u.openConnection() as HttpURLConnection).apply {
-        requestMethod = "GET"; connectTimeout = TIMEOUT; readTimeout = TIMEOUT
-      }
-      val body = readAll(c); c.disconnect(); body
-    } catch (_:Throwable){ "" }
-  }
+    /** Demo embedding. Server should accept {text} at /api/ops/embed; ignore if 404. */
+    suspend fun embedDemo(text: String): List<Double> = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().put("text", text).toString()
+        val req = Request.Builder()
+            .url(url("/api/ops/embed"))
+            .addDevHeaders()
+            .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+        Log.d("SlyOS", "Api.embedDemo: POST ${req.url}")
+        val res = client.newCall(req).execute()
+        Log.d("SlyOS", "Api.embedDemo: HTTP ${res.code}")
+        if (!res.isSuccessful) return@withContext emptyList()
 
-  suspend fun embedDemo(text:String): String = withContext(Dispatchers.IO) {
-    try {
-      val md = java.security.MessageDigest.getInstance("SHA-256")
-      md.digest(text.toByteArray()).joinToString("") { "%02x".format(it) }.take(16)
-    } catch (_:Throwable){ "0000000000000000" }
-  }
+        val body = res.body?.string().orEmpty()
+        val js = jsonOrNull(body) ?: return@withContext emptyList()
+        val arr: JSONArray? =
+            if (js.has("vector")) js.optJSONArray("vector")
+            else if (js.has("embedding")) js.optJSONArray("embedding")
+            else null
+        if (arr == null) return@withContext emptyList()
+        val out = ArrayList<Double>(arr.length())
+        for (i in 0 until arr.length()) out += arr.optDouble(i, 0.0)
+        out
+    }
+
+    /** Submit string result for a job id (tries several endpoints). */
+    suspend fun submit(id: String, result: String): Boolean = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().put("result", result).toString()
+        val paths = listOf(
+            "/api/jobs/$id/submit",
+            "/api/job/$id/submit",
+            "/api/ops/jobs/$id/submit",
+            "/api/ops/job/$id/submit",
+            "/api/jobs/$id" // some accept POST to job resource
+        )
+        for (p in paths) {
+            val req = Request.Builder()
+                .url(url(p))
+                .addDevHeaders()
+                .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+            Log.d("SlyOS", "Api.submit(str): POST ${req.url}")
+            val res = client.newCall(req).execute()
+            Log.d("SlyOS", "Api.submit(str): HTTP ${res.code}")
+            if (res.isSuccessful) return@withContext true
+        }
+        false
+    }
+
+    /** Submit vector result for a job id (same path scan). */
+    suspend fun submit(id: String, vector: List<Double>): Boolean = withContext(Dispatchers.IO) {
+        val bodyJson = JSONObject().put("vector", JSONArray(vector)).toString()
+        val paths = listOf(
+            "/api/jobs/$id/submit",
+            "/api/job/$id/submit",
+            "/api/ops/jobs/$id/submit",
+            "/api/ops/job/$id/submit",
+            "/api/jobs/$id"
+        )
+        for (p in paths) {
+            val req = Request.Builder()
+                .url(url(p))
+                .addDevHeaders()
+                .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+            Log.d("SlyOS", "Api.submit(vec): POST ${req.url}")
+            val res = client.newCall(req).execute()
+            Log.d("SlyOS", "Api.submit(vec): HTTP ${res.code}")
+            if (res.isSuccessful) return@withContext true
+        }
+        false
+    }
+
+    suspend fun submit(id: String, vector: FloatArray): Boolean = submit(id, vector.map { it.toDouble() })
 }
