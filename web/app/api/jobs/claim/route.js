@@ -1,4 +1,4 @@
-export const dynamic = 'force-dynamic'; export const runtime = 'nodejs';
+export const dynamic='force-dynamic'; export const runtime='nodejs';
 import { NextResponse } from 'next/server'; import { getDb } from '../../_lib/db';
 function deviceId(req){ const u=new URL(req.url); return u.searchParams.get('deviceId') || req.headers.get('x-device-id') || 'unknown'; }
 async function claim(req){
